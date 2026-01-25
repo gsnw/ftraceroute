@@ -190,16 +190,10 @@ void *run_trace(void *arg) {
       }
     }
 
-    // Buffer output for this hop to print it atomically
-    char out_buf[1024];
-    int off = 0;
-    off += snprintf(out_buf + off, sizeof(out_buf) - off, "[%s] %2d  ", args->host, ttl);
-    // Print the prefix, but since we probe loop, we might want to just print directly
-    // To keep the 'live' feel, we print the prefix line start:
-    pthread_mutex_lock(&log_mutex);
-    printf("%s", out_buf);
-    fflush(stdout);
-    pthread_mutex_unlock(&log_mutex);
+    // Create buffer for entire line to prevent “mixed output”
+    char line_buf[2048];
+    size_t off = 0;
+    off += snprintf(line_buf + off, sizeof(line_buf) - off, "[%s] %2d  ", args->host, ttl);
 
     bool printed_addr = false;
 
@@ -244,10 +238,9 @@ void *run_trace(void *arg) {
       gettimeofday(&t_send, NULL);
       if (sendto(sock, packet, pkt_len, 0, dst, dst_len) < 0) {
         perror("sendto");
-        pthread_mutex_lock(&log_mutex);
-        printf("* ");
-        fflush(stdout);
-        pthread_mutex_unlock(&log_mutex);
+        if (off < sizeof(line_buf)) {
+          off += snprintf(line_buf + off, sizeof(line_buf) - off, "* ");
+        }
         continue;
       }
 
@@ -262,10 +255,9 @@ void *run_trace(void *arg) {
         
         if (n < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            pthread_mutex_lock(&log_mutex);
-            printf("* ");
-            fflush(stdout);
-            pthread_mutex_unlock(&log_mutex);
+            if (off < sizeof(line_buf)) {
+              off += snprintf(line_buf + off, sizeof(line_buf) - off, "* ");
+            }
             break; 
           } else {
             perror("recvfrom");
@@ -337,29 +329,30 @@ void *run_trace(void *arg) {
           
           addr_to_host((struct sockaddr *)&reply_addr, rlen, host_name, sizeof(host_name), ip_txt, sizeof(ip_txt));
           
-          pthread_mutex_lock(&log_mutex);
+          // Write address to buffer (only for the first hit per hop)
+          int written = 0;
           if (host_name[0] == '\0') {
-            printf("%s  ", ip_txt);
+            written = snprintf(line_buf + off, sizeof(line_buf) - off, "%s  ", ip_txt);
           } else {
-            printf("%s (%s)  ", host_name, ip_txt);
+            written = snprintf(line_buf + off, sizeof(line_buf) - off, "%s (%s)  ", host_name, ip_txt);
           }
-          pthread_mutex_unlock(&log_mutex);
+          if (written > 0) off += written;
           printed_addr = true;
         }
 
         double rtt_ms = ms_between(t_send, t_rcv);
-        pthread_mutex_lock(&log_mutex);
-        printf("%.3f ms  ", rtt_ms);
-        fflush(stdout);
-        pthread_mutex_unlock(&log_mutex);
+        if (off < sizeof(line_buf)) {
+          off += snprintf(line_buf + off, sizeof(line_buf) - off, "%.3f ms  ", rtt_ms);
+        }
 
         if (final_reply) reached = true;
         break; // Next probe
       } 
     } 
 
+    // Now output the entire line atomically
     pthread_mutex_lock(&log_mutex);
-    printf("\n");
+    printf("%s\n", line_buf);
     pthread_mutex_unlock(&log_mutex);
     if (reached) break;
   }

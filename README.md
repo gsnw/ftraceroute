@@ -21,7 +21,7 @@ The program can only be run as root.
 Help: `ftraceroute -h`
 
 ```
-Usage: ftraceroute [options] <host>
+Usage: ftraceroute [options] <host> [host2 ...]
 Options:
   -h          Show this help message
   -v          Show version info
