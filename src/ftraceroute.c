@@ -27,6 +27,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -37,14 +38,24 @@
 
 double version = 0.1;
 
+/* Mutex for synchronized output to stdout */
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Struct to pass arguments to the thread */
+typedef struct {
+    char *host;
+    int max_hops;
+    int probes;
+    int timeout_ms;
+    uint16_t thread_id; /* Unique ID for ICMP correlation */
+} trace_args_t;
+
 int main(int argc, char **argv) {
 
   int opt;
   int max_hops = DEFAULT_MAX_HOPS;
   int probes = DEFAULT_PROBES;
   int timeout_ms = DEFAULT_TIMEOUT_MS;
-
-  char *host = NULL;
 
   while ((opt = getopt(argc, argv, "hvm:c:t:")) != -1) {
     switch (opt) {
@@ -77,19 +88,14 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Host is the first remaining non-optional argument.
-  if (optind < argc) {
-    host = argv[optind];
-  }
-
-  if (!host) {
-    fprintf(stderr, "Error: <host> (Hostname, IPv4 or IPv6) is required\n");
+  // Check if at least one host is provided
+  if (optind >= argc) {
+    fprintf(stderr, "Error: At least one <host> is required\n");
     usage(argv[0]);
     return 1;
   }
 
 #if defined(DEBUG) || defined(_DEBUG)
-  printf("Host: %s\n", host);
   printf("Max hops: %d\n", max_hops);
   printf("Probes: %d\n", probes);
   printf("Timeout: %d ms\n", timeout_ms);
@@ -99,9 +105,39 @@ int main(int argc, char **argv) {
   if (max_hops <= 0) max_hops = DEFAULT_MAX_HOPS;
   if (probes   <= 0) probes   = DEFAULT_PROBES;
 
+  int num_hosts = argc - optind;
+  pthread_t *threads = malloc(sizeof(pthread_t) * num_hosts);
+  trace_args_t *t_args = malloc(sizeof(trace_args_t) * num_hosts);
+
+  for (int i = 0; i < num_hosts; i++) {
+    t_args[i].host = argv[optind + i];
+    t_args[i].max_hops = max_hops;
+    t_args[i].probes = probes;
+    t_args[i].timeout_ms = timeout_ms;
+    // Generate a unique ID for this thread (mix PID and index) to separate ICMP replies
+    t_args[i].thread_id = (getpid() & 0xFF00) | ((i + 1) & 0x00FF);
+
+    if (pthread_create(&threads[i], NULL, run_trace, &t_args[i]) != 0) {
+      perror("pthread_create");
+    }
+  }
+
+  // Wait for all threads to finish
+  for (int i = 0; i < num_hosts; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  free(threads);
+  free(t_args);
+  return 0;
+}
+
+void *run_trace(void *arg) {
+  trace_args_t *args = (trace_args_t *)arg;
+
   // Resolve Host (IPv4 or IPv6)
   struct sockaddr_storage dst_store;
-  if (resolve_host(host, &dst_store) < 0) return 1;
+  if (resolve_host(args->host, &dst_store) < 0) return NULL;
 
   struct sockaddr *dst = (struct sockaddr *)&dst_store;
   socklen_t dst_len = (dst->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
@@ -109,51 +145,65 @@ int main(int argc, char **argv) {
   char dst_ip[INET6_ADDRSTRLEN];
   getnameinfo(dst, dst_len, NULL, 0, dst_ip, sizeof(dst_ip), NI_NUMERICHOST);
 
-  printf("ftraceroute to %s (%s), %d hops max, %d probes, %d ms timeout\n", host, dst_ip, max_hops, probes, timeout_ms);
+  pthread_mutex_lock(&log_mutex);
+  printf("[%s] Start traceroute to %s (%s)\n", args->host, args->host, dst_ip);
+  pthread_mutex_unlock(&log_mutex);
 
   // Choose Protocol based on family
   int proto = (dst->sa_family == AF_INET) ? IPPROTO_ICMP : IPPROTO_ICMPV6;
 
   int sock = socket(dst->sa_family, SOCK_RAW, proto);
   if (sock < 0) {
-    perror("socket creation failed (root privileges required?)");
-    return 1;
+    // Output error protected by mutex
+    pthread_mutex_lock(&log_mutex);
+    fprintf(stderr, "[%s] ", args->host);
+    perror("socket creation failed");
+    pthread_mutex_unlock(&log_mutex);
+    return NULL;
   }
 
   // Set recv timeout
   struct timeval tv;
-  tv.tv_sec  = timeout_ms / 1000;
-  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  tv.tv_sec  = args->timeout_ms / 1000;
+  tv.tv_usec = (args->timeout_ms % 1000) * 1000;
   if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
     perror("setsockopt(SO_RCVTIMEO)");
   }
 
-  pid_t pid = getpid() & 0xFFFF;
+  // Use the unique thread_id assigned in main instead of just getpid()
+  unsigned short ident = args->thread_id;
   unsigned short seq_base = 0;
   bool reached = false;
 
-  for (int ttl = 1; ttl <= max_hops && !reached; ++ttl) {
+  for (int ttl = 1; ttl <= args->max_hops && !reached; ++ttl) {
     if (dst->sa_family == AF_INET) {
       if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) < 0) {
         perror("setsockopt(IP_TTL)");
         close(sock);
-        return 1;
+        return NULL;
       }
     } else {
       if (setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &ttl, sizeof(ttl)) < 0) {
         perror("setsockopt(IPV6_UNICAST_HOPS)");
         close(sock);
-        return 1;
+        return NULL;
       }
     }
 
-    printf("%2d  ", ttl);
+    // Buffer output for this hop to print it atomically
+    char out_buf[1024];
+    int off = 0;
+    off += snprintf(out_buf + off, sizeof(out_buf) - off, "[%s] %2d  ", args->host, ttl);
+    // Print the prefix, but since we probe loop, we might want to just print directly
+    // To keep the 'live' feel, we print the prefix line start:
+    pthread_mutex_lock(&log_mutex);
+    printf("%s", out_buf);
     fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
 
     bool printed_addr = false;
-    // struct sockaddr_in hop_addr_printed = {0};
 
-    for (int p = 0; p < probes; ++p) {
+    for (int p = 0; p < args->probes; ++p) {
       unsigned char packet[PACKET_SIZE];
       memset(packet, 0, sizeof(packet));
       size_t pkt_len = 0;
@@ -165,7 +215,7 @@ int main(int argc, char **argv) {
         struct icmphdr *icmp = (struct icmphdr *)packet;
         icmp->type = ICMP_ECHO;
         icmp->code = 0;
-        icmp->un.echo.id = htons((unsigned short)pid);
+        icmp->un.echo.id = htons(ident);
         icmp->un.echo.sequence = htons(seq_base++);
         
         stamp_ptr = (struct timeval *)(packet + sizeof(struct icmphdr));
@@ -179,7 +229,7 @@ int main(int argc, char **argv) {
         struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet;
         icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
         icmp6->icmp6_code = 0;
-        icmp6->icmp6_id = htons((unsigned short)pid);
+        icmp6->icmp6_id = htons(ident);
         icmp6->icmp6_seq = htons(seq_base++);
         
         stamp_ptr = (struct timeval *)(packet + sizeof(struct icmp6_hdr));
@@ -194,8 +244,10 @@ int main(int argc, char **argv) {
       gettimeofday(&t_send, NULL);
       if (sendto(sock, packet, pkt_len, 0, dst, dst_len) < 0) {
         perror("sendto");
+        pthread_mutex_lock(&log_mutex);
         printf("* ");
         fflush(stdout);
+        pthread_mutex_unlock(&log_mutex);
         continue;
       }
 
@@ -210,8 +262,10 @@ int main(int argc, char **argv) {
         
         if (n < 0) {
           if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            pthread_mutex_lock(&log_mutex);
             printf("* ");
             fflush(stdout);
+            pthread_mutex_unlock(&log_mutex);
             break; 
           } else {
             perror("recvfrom");
@@ -233,8 +287,7 @@ int main(int argc, char **argv) {
           struct icmphdr *icmph = (struct icmphdr *)(recvbuf + iphdrlen);
 
           if (icmph->type == ICMP_ECHOREPLY) {
-            if (ntohs(icmph->un.echo.id) == (unsigned short)pid &&
-              ntohs(icmph->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
+            if (ntohs(icmph->un.echo.id) == ident && ntohs(icmph->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
               match = true;
               final_reply = true;
             }
@@ -245,8 +298,7 @@ int main(int argc, char **argv) {
             int ip2len = ip2->ihl * 4;
             if (n >= iphdrlen + 8 + ip2len + 8) {
                 struct icmphdr *icmp2 = (struct icmphdr *)(inner + ip2len);
-                if (ntohs(icmp2->un.echo.id) == (unsigned short)pid &&
-                  ntohs(icmp2->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
+                if (ntohs(icmp2->un.echo.id) == ident && ntohs(icmp2->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
                   match = true;
                 }
             }
@@ -259,8 +311,7 @@ int main(int argc, char **argv) {
           struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)recvbuf;
 
           if (icmp6h->icmp6_type == ICMP6_ECHO_REPLY) {
-            if (ntohs(icmp6h->icmp6_id) == (unsigned short)pid &&
-              ntohs(icmp6h->icmp6_seq) == (unsigned short)(seq_base - 1)) {
+            if (ntohs(icmp6h->icmp6_id) == ident && ntohs(icmp6h->icmp6_seq) == (unsigned short)(seq_base - 1)) {
               match = true;
               final_reply = true;
             }
@@ -271,8 +322,7 @@ int main(int argc, char **argv) {
             
             if (n >= (ssize_t)(offset_to_inner_icmp + sizeof(struct icmp6_hdr))) {
               struct icmp6_hdr *inner_icmp = (struct icmp6_hdr *)(recvbuf + offset_to_inner_icmp);
-              if (ntohs(inner_icmp->icmp6_id) == (unsigned short)pid &&
-                ntohs(inner_icmp->icmp6_seq) == (unsigned short)(seq_base - 1)) {
+              if (ntohs(inner_icmp->icmp6_id) == ident && ntohs(inner_icmp->icmp6_seq) == (unsigned short)(seq_base - 1)) {
                 match = true;
               }
             }
@@ -287,33 +337,39 @@ int main(int argc, char **argv) {
           
           addr_to_host((struct sockaddr *)&reply_addr, rlen, host_name, sizeof(host_name), ip_txt, sizeof(ip_txt));
           
+          pthread_mutex_lock(&log_mutex);
           if (host_name[0] == '\0') {
             printf("%s  ", ip_txt);
           } else {
             printf("%s (%s)  ", host_name, ip_txt);
           }
+          pthread_mutex_unlock(&log_mutex);
           printed_addr = true;
         }
 
         double rtt_ms = ms_between(t_send, t_rcv);
+        pthread_mutex_lock(&log_mutex);
         printf("%.3f ms  ", rtt_ms);
         fflush(stdout);
+        pthread_mutex_unlock(&log_mutex);
 
         if (final_reply) reached = true;
         break; // Next probe
       } 
     } 
 
+    pthread_mutex_lock(&log_mutex);
     printf("\n");
+    pthread_mutex_unlock(&log_mutex);
     if (reached) break;
   }
 
   if (!reached) {
-    fprintf(stderr, "Destination not reach (max_hops=%d).\n", max_hops);
+    fprintf(stderr, "[%s] Ziel nicht erreicht (max_hops=%d).\n", args->host, args->max_hops);
   }
 
   close(sock);
-  return 0;
+  return NULL;
 }
 
 /*
@@ -385,7 +441,7 @@ void addr_to_host(const struct sockaddr *addr, socklen_t len, char *host, size_t
 }
 
 void usage(const char *progname) {
-  printf("Usage: %s [options] <host>\n", progname);
+  printf("Usage: %s [options] <host> [host2 ...]\n", progname);
   printf("Options:\n");
   printf("  -h          Show this help message\n");
   printf("  -v          Show version info\n");

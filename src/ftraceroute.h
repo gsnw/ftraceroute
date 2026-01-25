@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+void *run_trace(void *arg);
 unsigned short checksum(void *b, int len);
 double ms_between(struct timeval a, struct timeval b);
 int resolve_host(const char *host, struct sockaddr_storage *out);
