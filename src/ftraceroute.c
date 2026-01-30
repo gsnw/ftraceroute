@@ -24,10 +24,11 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <pthread.h>
+#include <sys/select.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -36,19 +37,7 @@
 #include "ftraceroute.h"
 #include "options.h"
 
-double version = 0.1;
-
-/* Mutex for synchronized output to stdout */
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* Struct to pass arguments to the thread */
-typedef struct {
-    char *host;
-    int max_hops;
-    int probes;
-    int timeout_ms;
-    uint16_t thread_id; /* Unique ID for ICMP correlation */
-} trace_args_t;
+double version = 0.2;
 
 int main(int argc, char **argv) {
 
@@ -106,268 +95,292 @@ int main(int argc, char **argv) {
   if (probes   <= 0) probes   = DEFAULT_PROBES;
 
   int num_hosts = argc - optind;
-  pthread_t *threads = malloc(sizeof(pthread_t) * num_hosts);
-  trace_args_t *t_args = malloc(sizeof(trace_args_t) * num_hosts);
+  trace_session_t *sessions = calloc(num_hosts, sizeof(trace_session_t));
 
+  // Initialization of all sessions
   for (int i = 0; i < num_hosts; i++) {
-    t_args[i].host = argv[optind + i];
-    t_args[i].max_hops = max_hops;
-    t_args[i].probes = probes;
-    t_args[i].timeout_ms = timeout_ms;
-    // Generate a unique ID for this thread (mix PID and index) to separate ICMP replies
-    t_args[i].thread_id = (getpid() & 0xFF00) | ((i + 1) & 0x00FF);
+    session_init(&sessions[i], argv[optind + i], max_hops, probes, timeout_ms, i);
+  }
 
-    if (pthread_create(&threads[i], NULL, run_trace, &t_args[i]) != 0) {
-      perror("pthread_create");
+  // Main loop (event loop)
+  while (1) {
+    int active_count = 0;
+    int max_fd = -1;
+    fd_set readfds;
+    FD_ZERO(&readfds);
+
+    // 1. Collect FDs for select
+    for (int i = 0; i < num_hosts; i++) {
+      trace_session_t *s = &sessions[i];
+      if (s->state == STATE_FINISHED || s->state == STATE_ERROR) continue;
+      active_count++;
+
+      // While waiting for a response, we add the socket to the read set.
+      if (s->state == STATE_AWAIT_REPLY && s->sock >= 0) {
+        FD_SET(s->sock, &readfds);
+        if (s->sock > max_fd) max_fd = s->sock;
+      }
+    }
+    if (active_count == 0) break; // Alles erledigt
+
+    // 2. Select with a short timeout (10 ms) so that we can check send/timeouts.
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;
+    select(max_fd + 1, &readfds, NULL, NULL, &tv);
+
+    // 3. Processing for all sessions
+    for (int i = 0; i < num_hosts; i++) {
+      trace_session_t *s = &sessions[i];
+      if (s->state == STATE_FINISHED || s->state == STATE_ERROR) continue;
+
+      // A) Read (if data is available)
+      if (s->state == STATE_AWAIT_REPLY && s->sock >= 0 && FD_ISSET(s->sock, &readfds)) {
+        process_read(s);
+      }
+
+      // B) Timeout check (if still waiting)
+      if (s->state == STATE_AWAIT_REPLY) {
+        process_timeout_check(s);
+      }
+
+      // C) Preparing a new hop
+      if (s->state == STATE_PREPARE_HOP) {
+        s->current_ttl++;
+        if (s->current_ttl > s->max_hops) {
+          fprintf(stderr, "[%s] Target not reached (max_hops=%d).\n", s->host_arg, s->max_hops);
+          s->state = STATE_FINISHED;
+          session_close(s);
+        } else {
+          // Initialize output buffer
+          s->line_off = 0;
+          s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "[%s] %2d  ", s->host_arg, s->current_ttl);
+
+          // Set socket TTL
+          if (s->dst.ss_family == AF_INET) {
+            setsockopt(s->sock, IPPROTO_IP, IP_TTL, &s->current_ttl, sizeof(s->current_ttl));
+          } else {
+            setsockopt(s->sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &s->current_ttl, sizeof(s->current_ttl));
+          }
+          
+          s->current_probe = 0;
+          s->printed_addr = false;
+          s->state = STATE_SEND_PROBE;
+        }
+      }
+
+      // D) Send (when ready)
+      if (s->state == STATE_SEND_PROBE) {
+        process_send(s);
+      }
     }
   }
 
-  // Wait for all threads to finish
-  for (int i = 0; i < num_hosts; i++) {
-    pthread_join(threads[i], NULL);
-  }
-
-  free(threads);
-  free(t_args);
+  free(sessions);
   return 0;
 }
 
-void *run_trace(void *arg) {
-  trace_args_t *args = (trace_args_t *)arg;
-
-  // Resolve Host (IPv4 or IPv6)
-  struct sockaddr_storage dst_store;
-  if (resolve_host(args->host, &dst_store) < 0) return NULL;
-
-  struct sockaddr *dst = (struct sockaddr *)&dst_store;
-  socklen_t dst_len = (dst->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-
-  char dst_ip[INET6_ADDRSTRLEN];
-  getnameinfo(dst, dst_len, NULL, 0, dst_ip, sizeof(dst_ip), NI_NUMERICHOST);
-
-  pthread_mutex_lock(&log_mutex);
-  printf("[%s] Start traceroute to %s (%s)\n", args->host, args->host, dst_ip);
-  pthread_mutex_unlock(&log_mutex);
-
-  // Choose Protocol based on family
-  int proto = (dst->sa_family == AF_INET) ? IPPROTO_ICMP : IPPROTO_ICMPV6;
-
-  int sock = socket(dst->sa_family, SOCK_RAW, proto);
-  if (sock < 0) {
-    // Output error protected by mutex
-    pthread_mutex_lock(&log_mutex);
-    fprintf(stderr, "[%s] ", args->host);
-    perror("socket creation failed");
-    pthread_mutex_unlock(&log_mutex);
-    return NULL;
-  }
-
-  // Set recv timeout
-  struct timeval tv;
-  tv.tv_sec  = args->timeout_ms / 1000;
-  tv.tv_usec = (args->timeout_ms % 1000) * 1000;
-  if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-    perror("setsockopt(SO_RCVTIMEO)");
-  }
-
-  // Use the unique thread_id assigned in main instead of just getpid()
-  unsigned short ident = args->thread_id;
-  unsigned short seq_base = 0;
-  bool reached = false;
-
-  for (int ttl = 1; ttl <= args->max_hops && !reached; ++ttl) {
-    if (dst->sa_family == AF_INET) {
-      if (setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) < 0) {
-        perror("setsockopt(IP_TTL)");
-        close(sock);
-        return NULL;
-      }
-    } else {
-      if (setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &ttl, sizeof(ttl)) < 0) {
-        perror("setsockopt(IPV6_UNICAST_HOPS)");
-        close(sock);
-        return NULL;
-      }
-    }
-
-    // Create buffer for entire line to prevent “mixed output”
-    char line_buf[2048];
-    size_t off = 0;
-    off += snprintf(line_buf + off, sizeof(line_buf) - off, "[%s] %2d  ", args->host, ttl);
-
-    bool printed_addr = false;
-
-    for (int p = 0; p < args->probes; ++p) {
-      unsigned char packet[PACKET_SIZE];
-      memset(packet, 0, sizeof(packet));
-      size_t pkt_len = 0;
-
-      struct timeval *stamp_ptr = NULL;
-
-      // Build Packet
-      if (dst->sa_family == AF_INET) {
-        struct icmphdr *icmp = (struct icmphdr *)packet;
-        icmp->type = ICMP_ECHO;
-        icmp->code = 0;
-        icmp->un.echo.id = htons(ident);
-        icmp->un.echo.sequence = htons(seq_base++);
-        
-        stamp_ptr = (struct timeval *)(packet + sizeof(struct icmphdr));
-        pkt_len = sizeof(struct icmphdr) + sizeof(struct timeval);
-        
-        gettimeofday(stamp_ptr, NULL);
-        icmp->checksum = 0;
-        icmp->checksum = checksum(packet, (int)pkt_len);
-      } else {
-        // IPv6 ICMP Header construction
-        struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet;
-        icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
-        icmp6->icmp6_code = 0;
-        icmp6->icmp6_id = htons(ident);
-        icmp6->icmp6_seq = htons(seq_base++);
-        
-        stamp_ptr = (struct timeval *)(packet + sizeof(struct icmp6_hdr));
-        pkt_len = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
-        
-        gettimeofday(stamp_ptr, NULL);
-        // NOTE: Kernel calculates Checksum for ICMPv6 RAW sockets!
-        icmp6->icmp6_cksum = 0;
-      }
-
-      struct timeval t_send;
-      gettimeofday(&t_send, NULL);
-      if (sendto(sock, packet, pkt_len, 0, dst, dst_len) < 0) {
-        perror("sendto");
-        if (off < sizeof(line_buf)) {
-          off += snprintf(line_buf + off, sizeof(line_buf) - off, "* ");
-        }
-        continue;
-      }
-
-      // Receive Loop
-      unsigned char recvbuf[PACKET_SIZE];
-      for (;;) {
-        struct sockaddr_storage reply_addr;
-        socklen_t rlen = sizeof(reply_addr);
-        struct timeval t_rcv;
-        
-        ssize_t n = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&reply_addr, &rlen);
-        
-        if (n < 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (off < sizeof(line_buf)) {
-              off += snprintf(line_buf + off, sizeof(line_buf) - off, "* ");
-            }
-            break; 
-          } else {
-            perror("recvfrom");
-            break;
-          }
-        }
-        gettimeofday(&t_rcv, NULL);
-
-        bool match = false;
-        bool final_reply = false;
-
-        // --- Parsing Response ---
-        if (dst->sa_family == AF_INET) {
-          // IPv4: RAW socket delivers IP header + payload
-          struct iphdr *ip = (struct iphdr *)recvbuf;
-          int iphdrlen = ip->ihl * 4;
-          if (n < iphdrlen + 8) continue;
-
-          struct icmphdr *icmph = (struct icmphdr *)(recvbuf + iphdrlen);
-
-          if (icmph->type == ICMP_ECHOREPLY) {
-            if (ntohs(icmph->un.echo.id) == ident && ntohs(icmph->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
-              match = true;
-              final_reply = true;
-            }
-          } else if (icmph->type == ICMP_TIME_EXCEEDED) {
-            // Inner IP packet
-            unsigned char *inner = (unsigned char *)icmph + 8;
-            struct iphdr *ip2 = (struct iphdr *)inner;
-            int ip2len = ip2->ihl * 4;
-            if (n >= iphdrlen + 8 + ip2len + 8) {
-                struct icmphdr *icmp2 = (struct icmphdr *)(inner + ip2len);
-                if (ntohs(icmp2->un.echo.id) == ident && ntohs(icmp2->un.echo.sequence) == (unsigned short)(seq_base - 1)) {
-                  match = true;
-                }
-            }
-          }
-        } else {
-          // IPv6: RAW socket normally delivers ONLY the ICMP header (without IPv6 header)
-          // Check whether there is enough data for ICMPv6 headers
-          if (n < (ssize_t)sizeof(struct icmp6_hdr)) continue;
-
-          struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)recvbuf;
-
-          if (icmp6h->icmp6_type == ICMP6_ECHO_REPLY) {
-            if (ntohs(icmp6h->icmp6_id) == ident && ntohs(icmp6h->icmp6_seq) == (unsigned short)(seq_base - 1)) {
-              match = true;
-              final_reply = true;
-            }
-          } else if (icmp6h->icmp6_type == ICMP6_TIME_EXCEEDED) {
-            // Payload structure: [ICMP6 Header (8 bytes)] + [Original IPv6 Header (40 bytes)] + [Original ICMP6 Header Start]
-            // Skip 8 (ICMP header) + 40 (inner IPv6 header) to get to the inner ICMP header.
-            size_t offset_to_inner_icmp = sizeof(struct icmp6_hdr) + sizeof(struct ip6_hdr);
-            
-            if (n >= (ssize_t)(offset_to_inner_icmp + sizeof(struct icmp6_hdr))) {
-              struct icmp6_hdr *inner_icmp = (struct icmp6_hdr *)(recvbuf + offset_to_inner_icmp);
-              if (ntohs(inner_icmp->icmp6_id) == ident && ntohs(inner_icmp->icmp6_seq) == (unsigned short)(seq_base - 1)) {
-                match = true;
-              }
-            }
-          }
-        }
-
-        if (!match) continue;
-
-        if (!printed_addr) {
-          char host_name[NI_MAXHOST] = {0};
-          char ip_txt[INET6_ADDRSTRLEN] = {0};
-          
-          addr_to_host((struct sockaddr *)&reply_addr, rlen, host_name, sizeof(host_name), ip_txt, sizeof(ip_txt));
-          
-          // Write address to buffer (only for the first hit per hop)
-          int written = 0;
-          if (host_name[0] == '\0') {
-            written = snprintf(line_buf + off, sizeof(line_buf) - off, "%s  ", ip_txt);
-          } else {
-            written = snprintf(line_buf + off, sizeof(line_buf) - off, "%s (%s)  ", host_name, ip_txt);
-          }
-          if (written > 0) off += written;
-          printed_addr = true;
-        }
-
-        double rtt_ms = ms_between(t_send, t_rcv);
-        if (off < sizeof(line_buf)) {
-          off += snprintf(line_buf + off, sizeof(line_buf) - off, "%.3f ms  ", rtt_ms);
-        }
-
-        if (final_reply) reached = true;
-        break; // Next probe
-      } 
-    } 
-
-    // Now output the entire line atomically
-    pthread_mutex_lock(&log_mutex);
-    printf("%s\n", line_buf);
-    pthread_mutex_unlock(&log_mutex);
-    if (reached) break;
-  }
-
-  if (!reached) {
-    fprintf(stderr, "[%s] Ziel nicht erreicht (max_hops=%d).\n", args->host, args->max_hops);
-  }
-
-  close(sock);
-  return NULL;
-}
 
 /*
  * Functions
  */
+
+void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int idx) {
+  s->host_arg = host;
+  s->max_hops = mh;
+  s->probes_per_hop = pp;
+  s->timeout_ms = tm;
+  s->current_ttl = 0;
+  s->reached_dest = false;
+  s->ident = (getpid() & 0xFFFF) + idx; // Unique ID per session
+  s->seq_base = 0;
+
+  if (resolve_host(host, &s->dst) < 0) {
+    fprintf(stderr, "[%s] Could not resolve host.\n", host);
+    s->state = STATE_ERROR;
+    s->sock = -1;
+    return;
+  }
+
+  s->dst_len = (s->dst.ss_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+  s->proto = (s->dst.ss_family == AF_INET) ? IPPROTO_ICMP : IPPROTO_ICMPV6;
+
+
+  char dst_ip[INET6_ADDRSTRLEN];
+  getnameinfo((struct sockaddr *)&s->dst, s->dst_len, NULL, 0, dst_ip, sizeof(dst_ip), NI_NUMERICHOST);
+  printf("[%s] Start traceroute to %s (%s)\n", host, host, dst_ip);
+
+  
+ 
+  s->sock = socket(s->dst.ss_family, SOCK_RAW, s->proto);
+  if (s->sock < 0) {
+    perror("socket");
+    s->state = STATE_ERROR;
+    return;
+  }
+
+  // IMPORTANT: Non-blocking for single-threaded event loop
+  int flags = fcntl(s->sock, F_GETFL, 0);
+  fcntl(s->sock, F_SETFL, flags | O_NONBLOCK);
+
+  s->state = STATE_PREPARE_HOP;
+}
+
+void session_close(trace_session_t *s) {
+  if (s->sock >= 0) {
+    close(s->sock);
+    s->sock = -1;
+  }
+}
+
+void process_send(trace_session_t *s) {
+  if (s->current_probe >= s->probes_per_hop) {
+    flush_line(s);
+    if (s->reached_dest) {
+      s->state = STATE_FINISHED;
+      session_close(s);
+    } else {
+      s->state = STATE_PREPARE_HOP;
+    }
+    return;
+  }
+
+  unsigned char packet[PACKET_SIZE];
+  memset(packet, 0, sizeof(packet));
+  size_t pkt_len = 0;
+  struct timeval *stamp_ptr = NULL;
+
+  if (s->dst.ss_family == AF_INET) {
+    struct icmphdr *icmp = (struct icmphdr *)packet;
+    icmp->type = ICMP_ECHO;
+    icmp->code = 0;
+    icmp->un.echo.id = htons(s->ident);
+    icmp->un.echo.sequence = htons(s->seq_base++);
+        
+    stamp_ptr = (struct timeval *)(packet + sizeof(struct icmphdr));
+    pkt_len = sizeof(struct icmphdr) + sizeof(struct timeval);
+    gettimeofday(stamp_ptr, NULL);
+    icmp->checksum = 0;
+    icmp->checksum = checksum(packet, (int)pkt_len);
+  } else {
+    struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet;
+    icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+    icmp6->icmp6_code = 0;
+    icmp6->icmp6_id = htons(s->ident);
+    icmp6->icmp6_seq = htons(s->seq_base++);
+
+    stamp_ptr = (struct timeval *)(packet + sizeof(struct icmp6_hdr));
+    pkt_len = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
+    gettimeofday(stamp_ptr, NULL);
+  }
+
+  gettimeofday(&s->t_send, NULL);
+  if (sendto(s->sock, packet, pkt_len, 0, (struct sockaddr *)&s->dst, s->dst_len) < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "* ");
+      s->current_probe++;
+      return;
+    }
+  }
+  s->state = STATE_AWAIT_REPLY;
+}
+
+void process_timeout_check(trace_session_t *s) {
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  double elapsed = ms_between(s->t_send, now);
+  if (elapsed > s->timeout_ms) {
+    s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "* ");
+    s->current_probe++;
+    s->state = STATE_SEND_PROBE;
+  }
+}
+
+void process_read(trace_session_t *s) {
+  unsigned char recvbuf[PACKET_SIZE];
+  struct sockaddr_storage reply_addr;
+  socklen_t rlen = sizeof(reply_addr);
+  struct timeval t_rcv;
+
+  ssize_t n = recvfrom(s->sock, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&reply_addr, &rlen);
+  if (n < 0) return;
+
+  gettimeofday(&t_rcv, NULL);
+  bool match = false;
+  bool is_final = false;
+
+  if (s->dst.ss_family == AF_INET) {
+    struct iphdr *ip = (struct iphdr *)recvbuf;
+    int iphdrlen = ip->ihl * 4;
+    if (n >= iphdrlen + 8) {
+      struct icmphdr *icmph = (struct icmphdr *)(recvbuf + iphdrlen);
+      if (icmph->type == ICMP_ECHOREPLY) {
+        if (ntohs(icmph->un.echo.id) == s->ident && ntohs(icmph->un.echo.sequence) == (unsigned short)(s->seq_base - 1)) {
+          match = true; is_final = true;
+        }
+
+      } else if (icmph->type == ICMP_TIME_EXCEEDED) {
+        unsigned char *inner = (unsigned char *)icmph + 8;
+        struct iphdr *ip2 = (struct iphdr *)inner;
+        int ip2len = ip2->ihl * 4;
+        if (n >= iphdrlen + 8 + ip2len + 8) {
+          struct icmphdr *icmp2 = (struct icmphdr *)(inner + ip2len);
+          if (ntohs(icmp2->un.echo.id) == s->ident && ntohs(icmp2->un.echo.sequence) == (unsigned short)(s->seq_base - 1)) {
+            match = true;
+          }
+        }
+      }
+    }
+  } else {
+    // IPv6
+    if (n >= (ssize_t)sizeof(struct icmp6_hdr)) {
+      struct icmp6_hdr *icmp6h = (struct icmp6_hdr *)recvbuf;
+      if (icmp6h->icmp6_type == ICMP6_ECHO_REPLY) {
+        if (ntohs(icmp6h->icmp6_id) == s->ident && ntohs(icmp6h->icmp6_seq) == (unsigned short)(s->seq_base - 1)) {
+          match = true;
+          is_final = true;
+        }
+      } else if (icmp6h->icmp6_type == ICMP6_TIME_EXCEEDED) {
+        size_t offset = sizeof(struct icmp6_hdr) + sizeof(struct ip6_hdr);
+        if (n >= (ssize_t)(offset + sizeof(struct icmp6_hdr))) {
+          struct icmp6_hdr *inner = (struct icmp6_hdr *)(recvbuf + offset);
+          if (ntohs(inner->icmp6_id) == s->ident && ntohs(inner->icmp6_seq) == (unsigned short)(s->seq_base - 1)) {
+            match = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (match) {
+    // Address buffering (once per hop)
+    if (!s->printed_addr) {
+      char host_name[NI_MAXHOST] = {0};
+      char ip_txt[INET6_ADDRSTRLEN] = {0};
+      addr_to_host((struct sockaddr *)&reply_addr, rlen, host_name, sizeof(host_name), ip_txt, sizeof(ip_txt));
+
+      if (host_name[0] == '\0') {
+        s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "%s  ", ip_txt);
+      } else {
+        s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "%s (%s)  ", host_name, ip_txt);
+      }
+      s->printed_addr = true;
+    }
+    
+    double rtt = ms_between(s->t_send, t_rcv);
+    s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "%.3f ms  ", rtt);
+
+    if (is_final) s->reached_dest = true;
+    
+    // Test successful -> Next test
+    s->current_probe++;
+    s->state = STATE_SEND_PROBE;
+  }
+}
+
+void flush_line(trace_session_t *s) {
+  printf("%s\n", s->line_buf);
+}
 
 unsigned short checksum(void *b, int len) {
   unsigned short *buf = b;
