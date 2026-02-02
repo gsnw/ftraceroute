@@ -3,7 +3,7 @@
 ftraceroute is a small traceroute program that sends ICMP echo probes to network hosts.
 We try to use as little memory as possible.
 
-Current maintainer: German-Service-Network
+Current maintainer: German-Service-Network  
 Website: https://www.gsnw.de/
 
 ## Installation
