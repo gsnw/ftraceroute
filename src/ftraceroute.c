@@ -37,7 +37,9 @@
 #include "ftraceroute.h"
 #include "options.h"
 
-double version = 0.2;
+double version = 0.3;
+
+int pref_family = AF_UNSPEC;
 
 int main(int argc, char **argv) {
 
@@ -46,7 +48,7 @@ int main(int argc, char **argv) {
   int probes = DEFAULT_PROBES;
   int timeout_ms = DEFAULT_TIMEOUT_MS;
 
-  while ((opt = getopt(argc, argv, "hvm:c:t:")) != -1) {
+  while ((opt = getopt(argc, argv, "hv46m:c:t:")) != -1) {
     switch (opt) {
       case 'h':
         usage(argv[0]);
@@ -54,6 +56,20 @@ int main(int argc, char **argv) {
       case 'v':
         printf("Version: %f\n", version);
         return 0;
+      case '4':
+        if (pref_family == AF_INET6) {
+          fprintf(stderr, "Error: Options -4 and -6 are mutually exclusive.\n");
+          return -1;
+        }
+        pref_family = AF_INET;
+        break;
+      case '6':
+        if (pref_family == AF_INET) {
+          fprintf(stderr, "Error: Options -4 and -6 are mutually exclusive.\n");
+          return -1;
+        }
+        pref_family = AF_INET6;
+        break;
       case 'm':
         max_hops = atoi(optarg);
         break;
@@ -411,7 +427,7 @@ int resolve_host(const char *host, struct sockaddr_storage *out) {
   struct addrinfo hints = {0}, *res = NULL;
   
   // AF_UNSPEC allows IPv4 AND IPv6
-  hints.ai_family = AF_UNSPEC; 
+  hints.ai_family = pref_family;
   hints.ai_socktype = SOCK_RAW;
   // Leave protocol at 0 so that getaddrinfo finds the right one.
   // (or explicitly handle IPPROTO_ICMP / V6, but 0 is safer for dual stack)
@@ -451,6 +467,8 @@ void usage(const char *progname) {
   printf("Options:\n");
   printf("  -h          Show this help message\n");
   printf("  -v          Show version info\n");
+  printf("  -4          Use IPv4 only\n");
+  printf("  -6          Use IPv6 only\n");
   printf("  -m <value>  Set max hops\n");
   printf("  -c <value>  Set probe count\n");
   printf("  -t <value>  Set timeout in ms\n");
