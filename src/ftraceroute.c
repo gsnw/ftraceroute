@@ -48,8 +48,9 @@ int main(int argc, char **argv) {
   int probes = DEFAULT_PROBES;
   int timeout_ms = DEFAULT_TIMEOUT_MS;
   int interval_ms = DEFAULT_INTERVAL_MS;
+  int period_ms   = DEFAULT_PERIOD_MS;
 
-  while ((opt = getopt(argc, argv, "hv46m:c:t:i:")) != -1) {
+  while ((opt = getopt(argc, argv, "hv46m:c:t:i:p:")) != -1) {
     switch (opt) {
       case 'h':
         usage(argv[0]);
@@ -83,8 +84,11 @@ int main(int argc, char **argv) {
       case 'i':
         interval_ms = atoi(optarg);
         break;
+      case 'p':
+        period_ms = atoi(optarg);
+        break;
       case '?':
-        if(optopt == 'm' || optopt == 'c' || optopt == 'i') {
+        if(optopt == 'm' || optopt == 'c' || optopt == 'i' || optopt == 'p') {
           fprintf(stderr, "Option -%c requires an argument.\n", optopt);
         } else {
           fprintf(stderr, "Unknown option '-%c'\n", optopt);
@@ -109,6 +113,7 @@ int main(int argc, char **argv) {
   printf("Probes: %d\n", probes);
   printf("Timeout: %d ms\n", timeout_ms);
   printf("Interval: %d ms\n", interval_ms);
+  printf("Period:   %d ms\n", period_ms);
   printf("--------------\n");
 #endif /* DEBUG || _DEBUG */
 
@@ -121,7 +126,7 @@ int main(int argc, char **argv) {
 
   // Initialization of all sessions
   for (int i = 0; i < num_hosts; i++) {
-    session_init(&sessions[i], argv[optind + i], max_hops, probes, timeout_ms, interval_ms, i);
+    session_init(&sessions[i], argv[optind + i], max_hops, probes, timeout_ms, interval_ms, period_ms, i);
   }
 
   // Main loop (event loop)
@@ -166,7 +171,12 @@ int main(int argc, char **argv) {
         process_timeout_check(s);
       }
 
-      // B2) Interval wait between probes
+      // B2) Period wait between probes within the same hop
+      if (s->state == STATE_PERIOD_WAIT) {
+        process_period_check(s);
+      }
+
+      // B3) Interval wait between hops
       if (s->state == STATE_INTERVAL_WAIT) {
         process_interval_check(s);
       }
@@ -212,12 +222,13 @@ int main(int argc, char **argv) {
  * Functions
  */
 
-void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int idx) {
+void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int idx) {
   s->host_arg = host;
   s->max_hops = mh;
   s->probes_per_hop = pp;
   s->timeout_ms = tm;
   s->interval_ms = im;
+  s->period_ms = pm;
   s->current_ttl = 0;
   s->reached_dest = false;
   s->ident = (getpid() & 0xFFFF) + idx; // Unique ID per session
@@ -267,6 +278,9 @@ void process_send(trace_session_t *s) {
     if (s->reached_dest) {
       s->state = STATE_FINISHED;
       session_close(s);
+    } else if (s->interval_ms > 0) {
+      gettimeofday(&s->t_interval, NULL);
+      s->state = STATE_INTERVAL_WAIT;
     } else {
       s->state = STATE_PREPARE_HOP;
     }
@@ -320,9 +334,9 @@ void process_timeout_check(trace_session_t *s) {
   if (elapsed > s->timeout_ms) {
     s->line_off += snprintf(s->line_buf + s->line_off, sizeof(s->line_buf) - s->line_off, "* ");
     s->current_probe++;
-    if (s->interval_ms > 0) {
-      gettimeofday(&s->t_interval, NULL);
-      s->state = STATE_INTERVAL_WAIT;
+    if (s->period_ms > 0) {
+      gettimeofday(&s->t_period, NULL);
+      s->state = STATE_PERIOD_WAIT;
     } else {
       s->state = STATE_SEND_PROBE;
     }
@@ -334,6 +348,15 @@ void process_interval_check(trace_session_t *s) {
   gettimeofday(&now, NULL);
   double elapsed = ms_between(s->t_interval, now);
   if (elapsed >= s->interval_ms) {
+    s->state = STATE_SEND_PROBE;
+  }
+}
+
+void process_period_check(trace_session_t *s) {
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  double elapsed = ms_between(s->t_period, now);
+  if (elapsed >= s->period_ms) {
     s->state = STATE_SEND_PROBE;
   }
 }
@@ -414,11 +437,11 @@ void process_read(trace_session_t *s) {
 
     if (is_final) s->reached_dest = true;
     
-    // Test successful -> Next test
+    // Test successful -> Next probe (with optional period between probes within hop)
     s->current_probe++;
-    if (s->interval_ms > 0) {
-      gettimeofday(&s->t_interval, NULL);
-      s->state = STATE_INTERVAL_WAIT;
+    if (s->period_ms > 0) {
+      gettimeofday(&s->t_period, NULL);
+      s->state = STATE_PERIOD_WAIT;
     } else {
       s->state = STATE_SEND_PROBE;
     }
@@ -503,5 +526,6 @@ void usage(const char *progname) {
   printf("  -m <value>  Set max hops\n");
   printf("  -c <value>  Set probe count\n");
   printf("  -t <value>  Set timeout in ms\n");
-  printf("  -i <value>  Set interval between probes in ms\n");
+  printf("  -i <value>  Set interval between hops in ms\n");
+  printf("  -p <value>  Set interval between probes within a hop in ms\n");
 }

@@ -16,8 +16,7 @@
 #include <netinet/in.h>
 
 #define DEFAULT_INTERVAL_MS 0
-
-
+#define DEFAULT_PERIOD_MS   0
 
 /* State definition for a session */
 typedef enum {
@@ -25,6 +24,7 @@ typedef enum {
   STATE_SEND_PROBE,   // Ready to send a sample
   STATE_AWAIT_REPLY,  // Waiting for response (select)
   STATE_FINISHED,     // Goal achieved or Max Hops through
+  STATE_PERIOD_WAIT,
   STATE_INTERVAL_WAIT,
   STATE_ERROR         // Error case (socket defective, etc.)
 } session_state_t;
@@ -43,6 +43,8 @@ typedef struct {
     int timeout_ms;
     int interval_ms;
     struct timeval t_interval;
+    int period_ms;
+    struct timeval t_period;    
     
     // Current progress
     int current_ttl;
@@ -59,11 +61,12 @@ typedef struct {
     bool printed_addr;            // Has the address for this hop already been buffered?
 } trace_session_t;
 
-void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int idx);
+void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int idx);
 void session_close(trace_session_t *s);
 void process_send(trace_session_t *s);
 void process_timeout_check(trace_session_t *s);
 void process_interval_check(trace_session_t *s);
+void process_period_check(trace_session_t *s);
 void process_read(trace_session_t *s);
 void flush_line(trace_session_t *s);
 unsigned short checksum(void *b, int len);
