@@ -49,8 +49,9 @@ int main(int argc, char **argv) {
   int timeout_ms = DEFAULT_TIMEOUT_MS;
   int interval_ms = DEFAULT_INTERVAL_MS;
   int period_ms   = DEFAULT_PERIOD_MS;
+  int packet_size = DEFAULT_PACKET_SIZE;
 
-  while ((opt = getopt(argc, argv, "hv46m:c:t:i:p:")) != -1) {
+  while ((opt = getopt(argc, argv, "hv46m:c:t:i:p:s:")) != -1) {
     switch (opt) {
       case 'h':
         usage(argv[0]);
@@ -87,8 +88,12 @@ int main(int argc, char **argv) {
       case 'p':
         period_ms = atoi(optarg);
         break;
+      case 's':
+        packet_size = atoi(optarg);
+        if (packet_size > 65535) packet_size = 65535;
+        break;
       case '?':
-        if(optopt == 'm' || optopt == 'c' || optopt == 'i' || optopt == 'p') {
+        if(optopt == 'm' || optopt == 'c' || optopt == 'i' || optopt == 'p' || optopt == 's') {
           fprintf(stderr, "Option -%c requires an argument.\n", optopt);
         } else {
           fprintf(stderr, "Unknown option '-%c'\n", optopt);
@@ -114,6 +119,7 @@ int main(int argc, char **argv) {
   printf("Timeout: %d ms\n", timeout_ms);
   printf("Interval: %d ms\n", interval_ms);
   printf("Period:   %d ms\n", period_ms);
+  printf("Packet size (MTU):   %d bytes\n", packet_size)
   printf("--------------\n");
 #endif /* DEBUG || _DEBUG */
 
@@ -126,7 +132,7 @@ int main(int argc, char **argv) {
 
   // Initialization of all sessions
   for (int i = 0; i < num_hosts; i++) {
-    session_init(&sessions[i], argv[optind + i], max_hops, probes, timeout_ms, interval_ms, period_ms, i);
+    session_init(&sessions[i], argv[optind + i], max_hops, probes, timeout_ms, interval_ms, period_ms, packet_size, i);
   }
 
   // Main loop (event loop)
@@ -222,13 +228,14 @@ int main(int argc, char **argv) {
  * Functions
  */
 
-void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int idx) {
+void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int ps, int idx) {
   s->host_arg = host;
   s->max_hops = mh;
   s->probes_per_hop = pp;
   s->timeout_ms = tm;
   s->interval_ms = im;
   s->period_ms = pm;
+  s->packet_size = ps;
   s->current_ttl = 0;
   s->reached_dest = false;
   s->ident = (getpid() & 0xFFFF) + idx; // Unique ID per session
@@ -247,7 +254,7 @@ void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im
 
   char dst_ip[INET6_ADDRSTRLEN];
   getnameinfo((struct sockaddr *)&s->dst, s->dst_len, NULL, 0, dst_ip, sizeof(dst_ip), NI_NUMERICHOST);
-  printf("[%s] Start traceroute to %s (%s)\n", host, host, dst_ip);
+  printf("[%s] Start traceroute to %s (%s), %d bytes packets\n", host, host, dst_ip, s->packet_size);
 
   
  
@@ -287,9 +294,11 @@ void process_send(trace_session_t *s) {
     return;
   }
 
-  unsigned char packet[PACKET_SIZE];
-  memset(packet, 0, sizeof(packet));
-  size_t pkt_len = 0;
+  size_t min_len = (s->dst.ss_family == AF_INET) ? (sizeof(struct icmphdr) + sizeof(struct timeval)) : (sizeof(struct icmp6_hdr) + sizeof(struct timeval));
+  size_t pkt_len = (s->packet_size >= (int)min_len) ? (size_t)s->packet_size : min_len;
+
+  unsigned char packet[pkt_len];
+  memset(packet, 0, pkt_len);
   struct timeval *stamp_ptr = NULL;
 
   if (s->dst.ss_family == AF_INET) {
@@ -300,8 +309,8 @@ void process_send(trace_session_t *s) {
     icmp->un.echo.sequence = htons(s->seq_base++);
         
     stamp_ptr = (struct timeval *)(packet + sizeof(struct icmphdr));
-    pkt_len = sizeof(struct icmphdr) + sizeof(struct timeval);
     gettimeofday(stamp_ptr, NULL);
+
     icmp->checksum = 0;
     icmp->checksum = checksum(packet, (int)pkt_len);
   } else {
@@ -312,7 +321,6 @@ void process_send(trace_session_t *s) {
     icmp6->icmp6_seq = htons(s->seq_base++);
 
     stamp_ptr = (struct timeval *)(packet + sizeof(struct icmp6_hdr));
-    pkt_len = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
     gettimeofday(stamp_ptr, NULL);
   }
 
@@ -362,7 +370,7 @@ void process_period_check(trace_session_t *s) {
 }
 
 void process_read(trace_session_t *s) {
-  unsigned char recvbuf[PACKET_SIZE];
+  unsigned char recvbuf[65535];
   struct sockaddr_storage reply_addr;
   socklen_t rlen = sizeof(reply_addr);
   struct timeval t_rcv;
@@ -528,4 +536,5 @@ void usage(const char *progname) {
   printf("  -t <value>  Set timeout in ms\n");
   printf("  -i <value>  Set interval between hops in ms\n");
   printf("  -p <value>  Set interval between probes within a hop in ms\n");
+  printf("  -s <value>  Set packet size (MTU) in bytes\n");
 }

@@ -44,7 +44,8 @@ typedef struct {
     int interval_ms;
     struct timeval t_interval;
     int period_ms;
-    struct timeval t_period;    
+    struct timeval t_period;
+    int packet_size;
     
     // Current progress
     int current_ttl;
@@ -61,7 +62,7 @@ typedef struct {
     bool printed_addr;            // Has the address for this hop already been buffered?
 } trace_session_t;
 
-void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int idx);
+void session_init(trace_session_t *s, char *host, int mh, int pp, int tm, int im, int pm, int ps, int idx);
 void session_close(trace_session_t *s);
 void process_send(trace_session_t *s);
 void process_timeout_check(trace_session_t *s);
